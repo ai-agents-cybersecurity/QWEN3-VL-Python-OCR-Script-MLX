@@ -1,0 +1,7 @@
+mlx
+mlx-lm
+pillow
+huggingface-hub
+mlx-vlm
+torch
+torchvision
