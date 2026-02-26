@@ -5,3 +5,13 @@ huggingface-hub
 mlx-vlm
 torch
 torchvision
+
+# Qwen
+opencv-python
+numpy
+json5
+Pillow
+requests
+psutil
+scikit-image
+openai
