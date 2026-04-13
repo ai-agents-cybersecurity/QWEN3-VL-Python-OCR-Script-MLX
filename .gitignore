@@ -1,0 +1,26 @@
+# Claude
+CLAUDE.md
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Project directories (user content)
+input/
+output/
+
+# Checkpoints
+*.checkpoint.json
+
+# IDE
+.vscode/
+.idea/

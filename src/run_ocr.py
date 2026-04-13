@@ -22,6 +22,7 @@ What this does better than direct_ocr.py:
 Usage examples:
     python drun_ocr.py--video input/foo.mov --model gemini-2.0-flash --output-type md
     python drun_ocr.py--input_dir input --output_dir output --max-interval-seconds 4
+    python drun_ocr.py--input_dir input --use-local-qwen  # processes .png/.jpg images too
 
 Requirements: opencv-python, numpy, scikit-image, Pillow, json5, requests, psutil (same as your project).
 """
@@ -31,6 +32,7 @@ import sys
 import time
 import math
 import json
+import re
 import logging
 import argparse
 from pathlib import Path
@@ -62,7 +64,9 @@ except Exception:
     _HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
 
 HUGGINGFACE_HUB_CACHE = Path(_HF_CACHE).expanduser()
-DEFAULT_QWEN_REPO_ID = "mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16"
+DEFAULT_QWEN_REPO_ID = "mlx-community/Qwen3.5-27B-bf16"
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")
 DEFAULT_SYSTEM_PROMPT = (
     "You are a meticulous document analysis assistant. You extract and reproduce all visible "
     "content from images with perfect fidelity. Output raw Markdown directly — never wrap "
@@ -84,6 +88,34 @@ IMPORTANT:
 - If content is partially visible (cut off at the edge of the screen), extract only what is fully readable. Do not guess or hallucinate missing content.
 - Do not repeat content that appears identical or near-identical to content you already output.\
 """
+
+# ---------- Prompt Loading ----------
+
+def load_prompts(doc_type: str) -> Tuple[str, str]:
+    """Load system and user prompts from prompts/<doc_type>.md.
+
+    File format: system prompt, then ``---`` on its own line, then user prompt.
+    Falls back to built-in defaults if the file is missing.
+    """
+    prompts_dir = Path(__file__).resolve().parent.parent / "prompts"
+    prompt_file = prompts_dir / f"{doc_type}.md"
+
+    if not prompt_file.exists():
+        logger.warning(f"Prompt file not found: {prompt_file}, falling back to auto")
+        prompt_file = prompts_dir / "auto.md"
+
+    if not prompt_file.exists():
+        logger.warning("No prompt files found, using built-in defaults")
+        return DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+
+    content = prompt_file.read_text(encoding="utf-8")
+    parts = content.split("\n---\n", 1)
+
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    # No separator → treat entire file as user prompt
+    return DEFAULT_SYSTEM_PROMPT, content.strip()
+
 
 # ---------- Logging ----------
 logger = logging.getLogger("direct_ocr_awesome")
@@ -257,6 +289,22 @@ def extract_keyframes_hybrid(
     return keyframes
 
 
+# ---------- Image Loading ----------
+
+def load_images_as_keyframes(image_paths: List[str]) -> List[Tuple[float, np.ndarray]]:
+    """Load sorted image files as keyframes for the OCR pipeline."""
+    keyframes = []
+    for idx, path in enumerate(sorted(image_paths)):
+        bgr = cv2.imread(path)
+        if bgr is not None:
+            keyframes.append((float(idx), bgr))
+            logger.info(f"Loaded image {idx + 1}/{len(image_paths)}: {os.path.basename(path)}")
+        else:
+            logger.warning(f"Could not read image: {path}")
+    logger.info(f"Loaded {len(keyframes)} images as keyframes")
+    return keyframes
+
+
 # ---------- Local QWEN Model Support ----------
 
 def resolve_model_path(model_arg: Optional[str], repo_id: str) -> Path:
@@ -312,13 +360,37 @@ def build_ocr_prompt(tokenizer, image_path: str, system_prompt: str, user_prompt
     )
 
 
+def _strip_thinking(text: str) -> str:
+    """Remove chain-of-thought reasoning from Qwen3 model output.
+
+    Qwen3's chat template injects ``<think>\\n`` into the *prompt*, so the
+    generated text starts mid-thought — raw reasoning followed by ``</think>``,
+    then the real answer.  This handles three cases:
+
+    1. Complete ``<think>...</think>`` block present in output.
+    2. Only ``</think>`` present (opening tag was in the prompt) — strip
+       everything before and including it.
+    3. Neither tag present — model hit token limit during thinking and never
+       produced the answer; return empty string so the frame is skipped.
+    """
+    # Case 1: full <think>...</think> block in output
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    # Case 2: opening <think> was in the prompt; output starts with reasoning
+    # then </think> then the real answer
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1]
+    # Case 3: truncated <think> with no closing tag
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
 def ocr_with_qwen(
     model,
     tokenizer,
     frame_bgr: np.ndarray,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     user_prompt: str = DEFAULT_USER_PROMPT,
-    max_tokens: int = 2048,
+    max_tokens: int = 8192,
     temperature: float = 0.0,
 ) -> str:
     """Extract text from image using local QWEN model."""
@@ -328,7 +400,7 @@ def ocr_with_qwen(
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         tmp_path = tmp.name
         pil_image.save(tmp_path)
-    
+
     try:
         prompt = build_ocr_prompt(tokenizer, tmp_path, system_prompt, user_prompt)
         kwargs = {
@@ -336,22 +408,69 @@ def ocr_with_qwen(
             "image": tmp_path,
             "temperature": temperature,
         }
-        
+
         result = generate(model, tokenizer, prompt, **kwargs)
-        
+
         # Extract text from result
         if isinstance(result, str):
-            return result
+            text = result
         elif hasattr(result, 'text'):
-            return result.text
+            text = result.text
         else:
-            return str(result)
+            text = str(result)
+
+        # Strip <think>...</think> reasoning blocks from Qwen3 output
+        return _strip_thinking(text)
     finally:
         # Clean up temp file
         try:
             os.unlink(tmp_path)
         except:
             pass
+
+
+# ---------- MiniMax Local Server Support ----------
+
+DEFAULT_MINIMAX_URL = "http://127.0.0.1:8000"
+
+
+def ocr_with_minimax(
+    frame_bgr: np.ndarray,
+    base_url: str = DEFAULT_MINIMAX_URL,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    user_prompt: str = DEFAULT_USER_PROMPT,
+    max_tokens: int = 8192,
+    temperature: float = 1.0,
+) -> str:
+    """Extract text from image via a local MiniMax OpenAI-compatible server."""
+    import base64
+    import requests
+
+    # MiniMax is text-only: describe the image dimensions as context,
+    # then send the prompt as plain text.
+    h, w = frame_bgr.shape[:2]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"[Image: {w}x{h} pixels]\n\n{user_prompt}",
+        },
+    ]
+
+    resp = requests.post(
+        f"{base_url.rstrip('/')}/v1/chat/completions",
+        json={
+            "model": "local",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+        },
+        timeout=300,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
 
 # ---------- OCR + De-duplication ----------
@@ -575,8 +694,14 @@ def process_video(
     use_local_qwen: bool = False,
     qwen_model_path: Optional[str] = None,
     qwen_repo_id: str = DEFAULT_QWEN_REPO_ID,
-    qwen_max_tokens: int = 2048,
+    qwen_max_tokens: int = 4096,
     qwen_temperature: float = 0.0,
+    use_local_minimax: bool = False,
+    minimax_url: str = DEFAULT_MINIMAX_URL,
+    minimax_max_tokens: int = 4096,
+    minimax_temperature: float = 1.0,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    user_prompt: str = DEFAULT_USER_PROMPT,
     ssim_threshold: float = 0.97,
     phash_threshold: int = 8,
     hist_corr_threshold: float = 0.90,
@@ -587,17 +712,21 @@ def process_video(
     similarity: float = 0.95,
     unique_lines: bool = True,
     ngram_n: int = 3,
+    preloaded_keyframes: Optional[List[Tuple[float, np.ndarray]]] = None,
 ) -> str:
     """
     Improved pipeline that supports API-based OCR and local QWEN model.
+    If preloaded_keyframes is provided, skips video keyframe extraction.
     """
     # Setup OCR method
     qwen_model = None
     qwen_tokenizer = None
     original = None
     api_cfg = None
-    
-    if use_local_qwen:
+
+    if use_local_minimax:
+        logger.info(f"Using MiniMax server at {minimax_url}")
+    elif use_local_qwen:
         if not USING_MLX_VLM:
             raise RuntimeError(
                 "Local QWEN model requires mlx-vlm package. "
@@ -623,36 +752,64 @@ def process_video(
         except Exception as e:
             raise RuntimeError(f"Could not load API config: {e}. Use --use-local-qwen for local inference.")
 
-    keyframes = extract_keyframes_hybrid(
-        video_path,
-        ssim_threshold=ssim_threshold,
-        phash_threshold=phash_threshold,
-        hist_corr_threshold=hist_corr_threshold,
-        min_interval_seconds=min_interval_seconds,
-        max_interval_seconds=max_interval_seconds,
-        min_changed_area=min_changed_area,
-    )
+    if preloaded_keyframes is not None:
+        keyframes = preloaded_keyframes
+    else:
+        keyframes = extract_keyframes_hybrid(
+            video_path,
+            ssim_threshold=ssim_threshold,
+            phash_threshold=phash_threshold,
+            hist_corr_threshold=hist_corr_threshold,
+            min_interval_seconds=min_interval_seconds,
+            max_interval_seconds=max_interval_seconds,
+            min_changed_area=min_changed_area,
+        )
 
+    # Checkpoint: resume from prior run if it was interrupted
+    checkpoint_path = output_path + ".checkpoint.json"
     sections: List[str] = []
+    start_idx = 0
+
+    if Path(checkpoint_path).exists():
+        try:
+            ckpt = json.loads(Path(checkpoint_path).read_text(encoding="utf-8"))
+            sections = ckpt.get("sections", [])
+            start_idx = ckpt.get("next_idx", 0)
+            logger.info(f"Resuming from checkpoint: {start_idx}/{len(keyframes)} frames already done")
+        except Exception as e:
+            logger.warning(f"Could not load checkpoint, starting fresh: {e}")
+
     t0 = time.time()
 
     for idx, (ts, frame_bgr) in enumerate(keyframes, 1):
+        if idx <= start_idx:
+            continue  # already processed in a prior run
+
         t1 = time.time()
-        
+
         # Choose OCR method
-        if use_local_qwen:
+        if use_local_minimax:
+            text = ocr_with_minimax(
+                frame_bgr,
+                base_url=minimax_url,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=minimax_max_tokens,
+                temperature=minimax_temperature,
+            )
+        elif use_local_qwen:
             text = ocr_with_qwen(
                 qwen_model,
                 qwen_tokenizer,
                 frame_bgr,
-                system_prompt=DEFAULT_SYSTEM_PROMPT,
-                user_prompt=DEFAULT_USER_PROMPT,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
                 max_tokens=qwen_max_tokens,
                 temperature=qwen_temperature,
             )
         else:
             text = original.extract_text_from_image(frame_bgr, api_cfg, output_type=output_type) if original and hasattr(original, 'extract_text_from_image') else ''
-        
+
         dt = time.time() - t1
         logger.info(f"OCR {idx}/{len(keyframes)} at {ts:.2f}s -> {len(text)} chars in {dt:.2f}s")
 
@@ -666,51 +823,96 @@ def process_video(
             ngram_n=ngram_n
         )
         if new_secs:
+            # Insert a slide boundary marker before this slide's sections
+            if sections:
+                sections.append("---SLIDE_BREAK---")
             sections.extend(new_secs)
         else:
             logger.info("Skipped frame: duplicate content.")
 
+        # Save checkpoint after every frame
+        Path(checkpoint_path).write_text(
+            json.dumps({"next_idx": idx, "sections": sections}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     elapsed = time.time() - t0
     logger.info(f"OCR complete in {elapsed:.1f}s — writing output…")
 
-    # Combine sections
+    # Combine sections — replace slide boundary markers with proper separators
+    SLIDE_BREAK = "---SLIDE_BREAK---"
     if output_type == "json":
-        data = [{"section": i+1, "text": s} for i, s in enumerate(sections)]
+        # Group sections by slide
+        slides: List[List[str]] = [[]]
+        for s in sections:
+            if s == SLIDE_BREAK:
+                slides.append([])
+            else:
+                slides[-1].append(s)
+        data = [{"slide": i+1, "sections": secs} for i, secs in enumerate(slides) if secs]
         Path(output_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
     elif output_type == "md":
         out = []
-        for i, s in enumerate(sections, 1):
-            out.append(f"\n\n<!-- Frame Section {i} -->\n\n{s}")
+        slide_num = 1
+        for s in sections:
+            if s == SLIDE_BREAK:
+                slide_num += 1
+                out.append("\n\n---\n")
+            else:
+                out.append(f"\n\n{s}")
         Path(output_path).write_text("".join(out).lstrip(), encoding="utf-8")
     else:  # txt
-        Path(output_path).write_text("\n\n".join(sections).strip(), encoding="utf-8")
+        out_parts = []
+        for s in sections:
+            if s == SLIDE_BREAK:
+                out_parts.append("\n" + "=" * 40 + "\n")
+            else:
+                out_parts.append(s)
+        Path(output_path).write_text("\n\n".join(out_parts).strip(), encoding="utf-8")
+
+    # Remove checkpoint after successful write
+    try:
+        Path(checkpoint_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
     return output_path
 
 
-def find_videos(dir_path: str) -> List[str]:
-    videos = []
+def find_media(dir_path: str) -> Tuple[List[str], List[str]]:
+    """Return (videos, images) found under dir_path."""
+    videos, images = [], []
     for root, _, files in os.walk(dir_path):
-        for f in files:
-            if f.lower().endswith((".mp4", ".mov", ".mkv")):
-                videos.append(os.path.join(root, f))
-    return videos
+        for f in sorted(files):
+            full = os.path.join(root, f)
+            if f.lower().endswith(VIDEO_EXTENSIONS):
+                videos.append(full)
+            elif f.lower().endswith(IMAGE_EXTENSIONS):
+                images.append(full)
+    return videos, images
 
 
 def main():
-    p = argparse.ArgumentParser(description="Improved OCR from screen recordings (hybrid keyframes + de-dup)")
-    p.add_argument("--video", "-v", help="Single video to process")
-    p.add_argument("--input_dir", default="input/", help="Directory to scan for videos")
+    p = argparse.ArgumentParser(description="OCR from screen recordings and images (hybrid keyframes + de-dup)")
+    p.add_argument("--video", "-v", help="Single video or image file to process")
+    p.add_argument("--input_dir", default="input/", help="Directory to scan for videos and images")
     p.add_argument("--output_dir", default="output/", help="Directory to write outputs")
     p.add_argument("--model", default="gpt-5-mini", help="Model to use (same names as your original script)")
     p.add_argument("--output-type", default="md", choices=["txt", "json", "md"])
+    p.add_argument("--type", dest="doc_type", default="auto", choices=["code", "slides", "auto"],
+                   help="Document type — selects prompt from prompts/<type>.md (default: auto)")
     p.add_argument("--private", action="store_true", help="Use your script's private OCR if configured")
     # Local QWEN model options
     p.add_argument("--use-local-qwen", action="store_true", help="Use local QWEN model instead of API")
     p.add_argument("--qwen-model-path", help="Path to local QWEN model directory")
     p.add_argument("--qwen-repo-id", default=DEFAULT_QWEN_REPO_ID, help="Hugging Face repo ID for QWEN model")
-    p.add_argument("--qwen-max-tokens", type=int, default=2048, help="Max tokens for QWEN generation")
+    p.add_argument("--qwen-max-tokens", type=int, default=8192, help="Max tokens for QWEN generation")
     p.add_argument("--qwen-temperature", type=float, default=0.0, help="Temperature for QWEN generation")
+    # Local MiniMax server options
+    p.add_argument("--use-local-minimax", action="store_true", help="Use local MiniMax server (OpenAI-compatible)")
+    p.add_argument("--minimax-url", default=DEFAULT_MINIMAX_URL, help="MiniMax server base URL (default: http://127.0.0.1:8000)")
+    p.add_argument("--minimax-max-tokens", type=int, default=8192, help="Max tokens for MiniMax generation")
+    p.add_argument("--minimax-temperature", type=float, default=1.0, help="Temperature for MiniMax (recommended: 1.0)")
     # Hybrid change detection
     p.add_argument("--ssim-threshold", type=float, default=0.97)
     p.add_argument("--phash-threshold", type=int, default=8)
@@ -725,45 +927,76 @@ def main():
     p.add_argument("--ngram-n", type=int, default=3, help="n-gram size for near-duplicate detection")
     args = p.parse_args()
 
-    # Decide which videos to process
-    videos = [args.video] if args.video else find_videos(args.input_dir)
-    if not videos:
-        print(f"No videos found under {args.input_dir}")
-        sys.exit(2)
+    if args.use_local_qwen and args.use_local_minimax:
+        p.error("--use-local-qwen and --use-local-minimax are mutually exclusive")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    for vp in videos:
-        rel = os.path.relpath(vp, args.input_dir) if args.video is None else os.path.basename(vp)
-        stem = os.path.splitext(rel)[0]
-        out_ext = args.output_type
-        out_path = os.path.join(args.output_dir, f"{stem}.{out_ext}")
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    # Load prompts for the chosen document type
+    sys_prompt, usr_prompt = load_prompts(args.doc_type)
+    logger.info(f"Using prompt type: {args.doc_type}")
 
-        logger.info(f"Processing: {vp}")
-        process_video(
-            vp,
-            out_path,
-            model_name=args.model,
-            output_type=args.output_type,
-            private=args.private,
-            use_local_qwen=args.use_local_qwen,
-            qwen_model_path=args.qwen_model_path,
-            qwen_repo_id=args.qwen_repo_id,
-            qwen_max_tokens=args.qwen_max_tokens,
-            qwen_temperature=args.qwen_temperature,
-            ssim_threshold=args.ssim_threshold,
-            phash_threshold=args.phash_threshold,
-            hist_corr_threshold=args.hist_corr_threshold,
-            min_interval_seconds=args.min_interval_seconds,
-            max_interval_seconds=args.max_interval_seconds,
-            min_changed_area=args.min_changed_area,
-            dedupe_strategy=args.dedupe_strategy,
-            similarity=args.similarity,
-            unique_lines=args.unique_lines,
-            ngram_n=args.ngram_n,
-        )
+    # Common kwargs for process_video
+    pv_kwargs = dict(
+        model_name=args.model,
+        output_type=args.output_type,
+        private=args.private,
+        use_local_qwen=args.use_local_qwen,
+        qwen_model_path=args.qwen_model_path,
+        qwen_repo_id=args.qwen_repo_id,
+        qwen_max_tokens=args.qwen_max_tokens,
+        qwen_temperature=args.qwen_temperature,
+        use_local_minimax=args.use_local_minimax,
+        minimax_url=args.minimax_url,
+        minimax_max_tokens=args.minimax_max_tokens,
+        minimax_temperature=args.minimax_temperature,
+        system_prompt=sys_prompt,
+        user_prompt=usr_prompt,
+        ssim_threshold=args.ssim_threshold,
+        phash_threshold=args.phash_threshold,
+        hist_corr_threshold=args.hist_corr_threshold,
+        min_interval_seconds=args.min_interval_seconds,
+        max_interval_seconds=args.max_interval_seconds,
+        min_changed_area=args.min_changed_area,
+        dedupe_strategy=args.dedupe_strategy,
+        similarity=args.similarity,
+        unique_lines=args.unique_lines,
+        ngram_n=args.ngram_n,
+    )
+
+    if args.video:
+        # Single file — video or image
+        stem = os.path.splitext(os.path.basename(args.video))[0]
+        out_path = os.path.join(args.output_dir, f"{stem}.{args.output_type}")
+
+        if args.video.lower().endswith(IMAGE_EXTENSIONS):
+            keyframes = load_images_as_keyframes([args.video])
+            process_video(args.video, out_path, preloaded_keyframes=keyframes, **pv_kwargs)
+        else:
+            process_video(args.video, out_path, **pv_kwargs)
         print(f"Saved → {out_path}")
+    else:
+        videos, images = find_media(args.input_dir)
+        if not videos and not images:
+            print(f"No media files found under {args.input_dir}")
+            sys.exit(2)
+
+        for vp in videos:
+            rel = os.path.relpath(vp, args.input_dir)
+            stem = os.path.splitext(rel)[0]
+            out_path = os.path.join(args.output_dir, f"{stem}.{args.output_type}")
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            logger.info(f"Processing video: {vp}")
+            process_video(vp, out_path, **pv_kwargs)
+            print(f"Saved → {out_path}")
+
+        if images:
+            keyframes = load_images_as_keyframes(images)
+            stem = Path(args.input_dir).resolve().stem or "images"
+            out_path = os.path.join(args.output_dir, f"{stem}_ocr.{args.output_type}")
+            logger.info(f"Processing {len(images)} images from {args.input_dir}")
+            process_video("<images>", out_path, preloaded_keyframes=keyframes, **pv_kwargs)
+            print(f"Saved → {out_path}")
 
 
 if __name__ == "__main__":
